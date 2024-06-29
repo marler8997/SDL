@@ -1,5 +1,126 @@
 const std = @import("std");
 
+const SdlOption = struct {
+    name: []const u8,
+    desc: []const u8,
+    default: bool,
+    // SDL configs affect the public SDL_config.h header file and will
+    sdl_configs: []const []const u8,
+    // C Macros only apply to the private SDL implementation
+    c_macros: []const []const u8 = &.{ },
+    sdl_files: []const []const u8,
+    system_libs: []const []const u8,
+};
+
+const render_driver_sw = SdlOption{
+    .name = "render_driver_software",
+    .desc = "enable the software render driver",
+    .default = true,
+    .sdl_configs = &.{ },
+    .c_macros = &.{ "SDL_VIDEO_RENDER_SW" },
+    .sdl_files = &.{
+        "src/render/software/SDL_blendfillrect.c",
+        "src/render/software/SDL_blendline.c",
+        "src/render/software/SDL_blendpoint.c",
+        "src/render/software/SDL_drawline.c",
+        "src/render/software/SDL_drawpoint.c",
+        "src/render/software/SDL_render_sw.c",
+        "src/render/software/SDL_rotate.c",
+        "src/render/software/SDL_triangle.c",
+    },
+    .system_libs = &.{ },
+};
+
+const linux_options = [_]SdlOption{
+    .{
+        .name = "video_driver_x11",
+        .desc = "enable the x11 video driver",
+        .default = true,
+        .sdl_configs = &.{
+            "SDL_VIDEO_DRIVER_X11",
+            "SDL_VIDEO_DRIVER_X11_SUPPORTS_GENERIC_EVENTS",
+        },
+        .sdl_files = &.{ },
+        .system_libs = &.{ "x11", "xext" },
+    },
+    render_driver_sw,
+    .{
+        .name = "render_driver_ogl",
+        .desc = "enable the opengl render driver",
+        .default = true,
+        .sdl_configs = &.{ "SDL_VIDEO_RENDER_OGL" },
+        .sdl_files = &.{
+            "src/render/opengl/SDL_render_gl.c",
+            "src/render/opengl/SDL_shaders_gl.c",
+        },
+        .system_libs = &.{ },
+    },
+    .{
+        .name = "render_driver_ogl_es",
+        .desc = "enable the opengl es render driver",
+        .default = true,
+        .sdl_configs = &.{ "SDL_VIDEO_RENDER_OGL_ES" },
+        .sdl_files = &.{
+            "src/render/opengles/SDL_render_gles.c",
+        },
+        .system_libs = &.{ },
+    },
+    .{
+        .name = "render_driver_ogl_es2",
+        .desc = "enable the opengl es2 render driver",
+        .default = true,
+        .sdl_configs = &.{ "SDL_VIDEO_RENDER_OGL_ES2" },
+        .sdl_files = &.{
+            "src/render/opengles2/SDL_render_gles2.c",
+            "src/render/opengles2/SDL_shaders_gles2.c",
+        },
+        .system_libs = &.{ },
+    },
+    .{
+        .name = "audio_driver_pulse",
+        .desc = "enable the pulse audio driver",
+        .default = true,
+        .sdl_configs = &.{ "SDL_AUDIO_DRIVER_PULSEAUDIO" },
+        .sdl_files = &.{ "src/audio/pulseaudio/SDL_pulseaudio.c" },
+        .system_libs = &.{ "pulse" },
+    },
+    .{
+        .name = "audio_driver_alsa",
+        .desc = "enable the alsa audio driver",
+        .default = false,
+        .sdl_configs = &.{ "SDL_AUDIO_DRIVER_ALSA" },
+        .sdl_files = &.{ "src/audio/alsa/SDL_alsa_audio.c" },
+        .system_libs = &.{ "alsa" },
+    },
+};
+
+fn applyOptions(
+    b: *std.Build,
+    lib: *std.Build.Step.Compile,
+    files: *std.ArrayList([]const u8),
+    config_header: *std.Build.Step.ConfigHeader,
+    comptime options: []const SdlOption,
+) void {
+    inline for (options) |option| {
+        const enabled = if (b.option(bool, option.name, option.desc)) |o| o else option.default;
+        for (option.c_macros) |name| {
+            std.log.info("MACRO {s}={s}", .{name, if (enabled) "1" else "0"});
+            lib.defineCMacro(name, if (enabled) "1" else "0");
+        }
+        for (option.sdl_configs) |config| {
+            // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            std.log.info("config {s}={}", .{config, if (enabled) @as(u1, 1) else @as(u1, 0)});
+            config_header.values.put(config, .{ .int = if (enabled) 1 else 0 }) catch @panic("OOM");
+        }
+        if (enabled) {
+            files.appendSlice(option.sdl_files) catch @panic("OOM");
+            for (option.system_libs) |lib_name| {
+                lib.linkSystemLibrary(lib_name);
+            }
+        }
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -11,12 +132,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    lib.addIncludePath(b.path("include"));
     lib.addCSourceFiles(.{ .files = &generic_src_files });
     lib.defineCMacro("SDL_USE_BUILTIN_OPENGL_DEFINITIONS", "1");
     lib.linkLibC();
+    var use_pregenerated_config = false;
     switch (t.os.tag) {
         .windows => {
+            use_pregenerated_config = true;
             lib.addCSourceFiles(.{ .files = &windows_src_files });
             lib.linkSystemLibrary("setupapi");
             lib.linkSystemLibrary("winmm");
@@ -27,6 +149,7 @@ pub fn build(b: *std.Build) void {
             lib.linkSystemLibrary("ole32");
         },
         .macos => {
+            use_pregenerated_config = true;
             lib.addCSourceFiles(.{ .files = &darwin_src_files });
             lib.addCSourceFiles(.{
                 .files = &objective_c_src_files,
@@ -45,6 +168,7 @@ pub fn build(b: *std.Build) void {
             lib.linkFramework("Foundation");
         },
         .emscripten => {
+            use_pregenerated_config = true;
             lib.defineCMacro("__EMSCRIPTEN_PTHREADS__ ", "1");
             lib.defineCMacro("USE_SDL", "2");
             lib.addCSourceFiles(.{ .files = &emscripten_src_files });
@@ -60,16 +184,83 @@ pub fn build(b: *std.Build) void {
 
             lib.addIncludePath(b.path(cache_include));
         },
-        else => {
-            const config_header = b.addConfigHeader(.{
-                .style = .{ .cmake = b.path("include/SDL_config.h.cmake") },
-                .include_path = "SDL2/SDL_config.h",
-            }, .{});
-            lib.addConfigHeader(config_header);
-            lib.installConfigHeader(config_header);
-        },
+        else => { },
     }
-    lib.installHeadersDirectory(b.path("include"), "SDL2", .{});
+    if (use_pregenerated_config) {
+        lib.addCSourceFiles(.{ .files = render_driver_sw.sdl_files });
+        lib.addIncludePath(b.path("include"));
+        lib.installHeadersDirectory(b.path("include"), "SDL2", .{});
+    } else {
+        var files = std.ArrayList([]const u8).init(b.allocator);
+        defer files.deinit();
+
+        // copy all headers except the pregenerated SDL_config.h and SDL_revision.h
+        // to another directory to avoid including them
+        const write_files = b.addWriteFiles();
+
+        inline for (static_headers) |header| {
+            _ = write_files.addCopyFile(b.path("include/" ++ header), header);
+        }
+        lib.addIncludePath(write_files.getDirectory());
+        lib.installHeadersDirectory(write_files.getDirectory(), "SDL2", .{});
+
+        const config_header = b.addConfigHeader(.{
+            .style = .{ .cmake = b.path("include/SDL_config.h.cmake") },
+            .include_path = "SDL_config.h",
+        }, .{
+            .HAVE_STDINT_H = 1,
+            .HAVE_SYS_TYPES_H = 1,
+            .HAVE_STDIO_H = 1,
+            .HAVE_STRING_H = 1,
+            .HAVE_ALLOCA_H = 1,
+            .HAVE_CTYPE_H = 1,
+            .HAVE_FLOAT_H = 1,
+            .HAVE_ICONV_H = 1,
+            .HAVE_INTTYPES_H = 1,
+            .HAVE_LIMITS_H = 1,
+            .HAVE_MALLOC_H = 1,
+            .HAVE_MATH_H = 1,
+            .HAVE_MEMORY_H = 1,
+            .HAVE_SIGNAL_H = 1,
+            .HAVE_STDARG_H = 1,
+            .HAVE_STDDEF_H = 1,
+            .HAVE_STDLIB_H = 1,
+            .HAVE_STRINGS_H = 1,
+            .HAVE_WCHAR_H = 1,
+            .HAVE_LIBUNWIND_H = 1,
+            .STDC_HEADERS = 1,
+            .SDL_DEFAULT_ASSERT_LEVEL_CONFIGURED = 1,
+        });
+        switch (t.os.tag) {
+            .linux => {
+                // TODO: not sure why we need this, this should be defined
+                //       in SDL_config.h but it doesn't seem to be working?
+                lib.root_module.addCMacro("HAVE_LINUX_INPUT_H", "1");
+                files.appendSlice(&linux_src_files) catch @panic("OOM");
+                config_header.addValues(.{
+                    .HAVE_LINUX_INPUT_H = 1,
+                    .SDL_THREAD_PTHREAD = 1,
+                    .SDL_THREAD_PTHREAD_RECURSIVE_MUTEX = 1,
+                    .SDL_TIMER_UNIX = 1,
+                    .SDL_HAPTIC_LINUX = 1,
+                    .SDL_FILESYSTEM_UNIX = 1,
+                    .SDL_LOADSO_DLOPEN = 1,
+                });
+                applyOptions(b, lib, &files, config_header, &linux_options);
+            },
+            else => {},
+        }
+        lib.addCSourceFiles(.{ .files = files.toOwnedSlice() catch @panic("OOM") });
+        lib.addConfigHeader(config_header);
+        lib.installConfigHeader(config_header);
+
+        const revision_header = b.addConfigHeader(.{
+            .style = .{ .cmake = b.path("include/SDL_revision.h.cmake") },
+            .include_path = "SDL_revision.h",
+        }, .{ });
+        lib.addConfigHeader(revision_header);
+        lib.installConfigHeader(revision_header);
+    }
     b.installArtifact(lib);
 }
 
@@ -181,15 +372,6 @@ const generic_src_files = [_][]const u8{
     "src/video/dummy/SDL_nullframebuffer.c",
     "src/video/dummy/SDL_nullvideo.c",
 
-    "src/render/software/SDL_blendfillrect.c",
-    "src/render/software/SDL_blendline.c",
-    "src/render/software/SDL_blendpoint.c",
-    "src/render/software/SDL_drawline.c",
-    "src/render/software/SDL_drawpoint.c",
-    "src/render/software/SDL_render_sw.c",
-    "src/render/software/SDL_rotate.c",
-    "src/render/software/SDL_triangle.c",
-
     "src/audio/dummy/SDL_dummyaudio.c",
 
     "src/joystick/hidapi/SDL_hidapi_combined.c",
@@ -278,33 +460,50 @@ const windows_src_files = [_][]const u8{
 };
 
 const linux_src_files = [_][]const u8{
-    "src/core/linux/SDL_dbus.c",
-    "src/core/linux/SDL_evdev.c",
-    "src/core/linux/SDL_evdev_capabilities.c",
-    "src/core/linux/SDL_evdev_kbd.c",
-    "src/core/linux/SDL_fcitx.c",
-    "src/core/linux/SDL_ibus.c",
-    "src/core/linux/SDL_ime.c",
-    "src/core/linux/SDL_sandbox.c",
+    //"src/core/linux/SDL_dbus.c",
+    //"src/core/linux/SDL_evdev.c",
+    //"src/core/linux/SDL_evdev_capabilities.c",
+    //"src/core/linux/SDL_evdev_kbd.c",
+    //"src/core/linux/SDL_fcitx.c",
+    //"src/core/linux/SDL_ibus.c",
+    //"src/core/linux/SDL_ime.c",
+    //"src/core/linux/SDL_sandbox.c",
     "src/core/linux/SDL_threadprio.c",
-    "src/core/linux/SDL_udev.c",
-    "src/haptic/linux/SDL_syshaptic.c",
-    "src/hidapi/linux/hid.c",
-    "src/joystick/linux/SDL_sysjoystick.c",
-    "src/power/linux/SDL_syspower.c",
+    //"src/core/linux/SDL_udev.c",
+    "src/core/unix/SDL_poll.c",
 
-    "src/video/wayland/SDL_waylandclipboard.c",
-    "src/video/wayland/SDL_waylanddatamanager.c",
-    "src/video/wayland/SDL_waylanddyn.c",
-    "src/video/wayland/SDL_waylandevents.c",
-    "src/video/wayland/SDL_waylandkeyboard.c",
-    "src/video/wayland/SDL_waylandmessagebox.c",
-    "src/video/wayland/SDL_waylandmouse.c",
-    "src/video/wayland/SDL_waylandopengles.c",
-    "src/video/wayland/SDL_waylandtouch.c",
-    "src/video/wayland/SDL_waylandvideo.c",
-    "src/video/wayland/SDL_waylandvulkan.c",
-    "src/video/wayland/SDL_waylandwindow.c",
+    "src/filesystem/unix/SDL_sysfilesystem.c",
+
+    "src/haptic/linux/SDL_syshaptic.c",
+    //"src/hidapi/linux/hid.c",
+
+    "src/loadso/dlopen/SDL_sysloadso.c",
+    "src/joystick/linux/SDL_sysjoystick.c",
+    "src/joystick/dummy/SDL_sysjoystick.c",
+
+    "src/misc/unix/SDL_sysurl.c",
+
+    //"src/power/linux/SDL_syspower.c",
+
+    "src/thread/pthread/SDL_sysmutex.c",
+    "src/thread/pthread/SDL_syssem.c",
+    "src/thread/pthread/SDL_systhread.c",
+    "src/thread/pthread/SDL_systls.c",
+
+    "src/timer/unix/SDL_systimer.c",
+
+    //"src/video/wayland/SDL_waylandclipboard.c",
+    //"src/video/wayland/SDL_waylanddatamanager.c",
+    //"src/video/wayland/SDL_waylanddyn.c",
+    //"src/video/wayland/SDL_waylandevents.c",
+    //"src/video/wayland/SDL_waylandkeyboard.c",
+    //"src/video/wayland/SDL_waylandmessagebox.c",
+    //"src/video/wayland/SDL_waylandmouse.c",
+    //"src/video/wayland/SDL_waylandopengles.c",
+    //"src/video/wayland/SDL_waylandtouch.c",
+    //"src/video/wayland/SDL_waylandvideo.c",
+    //"src/video/wayland/SDL_waylandvulkan.c",
+    //"src/video/wayland/SDL_waylandwindow.c",
 
     "src/video/x11/SDL_x11clipboard.c",
     "src/video/x11/SDL_x11dyn.c",
@@ -325,9 +524,8 @@ const linux_src_files = [_][]const u8{
     "src/video/x11/SDL_x11xinput2.c",
     "src/video/x11/edid-parse.c",
 
-    "src/audio/alsa/SDL_alsa_audio.c",
-    "src/audio/jack/SDL_jackaudio.c",
-    "src/audio/pulseaudio/SDL_pulseaudio.c",
+    //"src/audio/jack/SDL_jackaudio.c",
+    //"src/audio/pulseaudio/SDL_pulseaudio.c",
 };
 
 const darwin_src_files = [_][]const u8{
@@ -665,4 +863,96 @@ const unknown_src_files = [_][]const u8{
     "src/render/vitagxm/SDL_render_vita_gxm.c",
     "src/render/vitagxm/SDL_render_vita_gxm_memory.c",
     "src/render/vitagxm/SDL_render_vita_gxm_tools.c",
+};
+
+const static_headers = [_][]const u8{
+    "begin_code.h",
+    "close_code.h",
+    "SDL_assert.h",
+    "SDL_atomic.h",
+    "SDL_audio.h",
+    "SDL_bits.h",
+    "SDL_blendmode.h",
+    "SDL_clipboard.h",
+    "SDL_config_android.h",
+    "SDL_config_emscripten.h",
+    "SDL_config_iphoneos.h",
+    "SDL_config_macosx.h",
+    "SDL_config_minimal.h",
+    "SDL_config_ngage.h",
+    "SDL_config_os2.h",
+    "SDL_config_pandora.h",
+    "SDL_config_windows.h",
+    "SDL_config_wingdk.h",
+    "SDL_config_winrt.h",
+    "SDL_config_xbox.h",
+    "SDL_copying.h",
+    "SDL_cpuinfo.h",
+    "SDL_egl.h",
+    "SDL_endian.h",
+    "SDL_error.h",
+    "SDL_events.h",
+    "SDL_filesystem.h",
+    "SDL_gamecontroller.h",
+    "SDL_gesture.h",
+    "SDL_guid.h",
+    "SDL.h",
+    "SDL_haptic.h",
+    "SDL_hidapi.h",
+    "SDL_hints.h",
+    "SDL_joystick.h",
+    "SDL_keyboard.h",
+    "SDL_keycode.h",
+    "SDL_loadso.h",
+    "SDL_locale.h",
+    "SDL_log.h",
+    "SDL_main.h",
+    "SDL_messagebox.h",
+    "SDL_metal.h",
+    "SDL_misc.h",
+    "SDL_mouse.h",
+    "SDL_mutex.h",
+    "SDL_name.h",
+    "SDL_opengles2_gl2ext.h",
+    "SDL_opengles2_gl2.h",
+    "SDL_opengles2_gl2platform.h",
+    "SDL_opengles2.h",
+    "SDL_opengles2_khrplatform.h",
+    "SDL_opengles.h",
+    "SDL_opengl_glext.h",
+    "SDL_opengl.h",
+    "SDL_pixels.h",
+    "SDL_platform.h",
+    "SDL_power.h",
+    "SDL_quit.h",
+    "SDL_rect.h",
+    "SDL_render.h",
+    "SDL_rwops.h",
+    "SDL_scancode.h",
+    "SDL_sensor.h",
+    "SDL_shape.h",
+    "SDL_stdinc.h",
+    "SDL_surface.h",
+    "SDL_system.h",
+    "SDL_syswm.h",
+    "SDL_test_assert.h",
+    "SDL_test_common.h",
+    "SDL_test_compare.h",
+    "SDL_test_crc32.h",
+    "SDL_test_font.h",
+    "SDL_test_fuzzer.h",
+    "SDL_test.h",
+    "SDL_test_harness.h",
+    "SDL_test_images.h",
+    "SDL_test_log.h",
+    "SDL_test_md5.h",
+    "SDL_test_memory.h",
+    "SDL_test_random.h",
+    "SDL_thread.h",
+    "SDL_timer.h",
+    "SDL_touch.h",
+    "SDL_types.h",
+    "SDL_version.h",
+    "SDL_video.h",
+    "SDL_vulkan.h",
 };
